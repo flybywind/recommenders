@@ -12,6 +12,7 @@ from tensorflow import keras
 
 from functools import partial
 
+
 class LogTransformLayer(keras.layers.Layer):
     """Logarithmic Transformation Layer in Adaptive factorization network, which models arbitrary-order cross features.
 
@@ -35,8 +36,9 @@ class LogTransformLayer(keras.layers.Layer):
         self.ltl_hidden_size = ltl_hidden_size
         self.l2_regularizer = None if l2_reg is None else keras.regularizers.L2(l2_reg)
         self.bn = [keras.layers.BatchNormalization() for _ in range(2)]
+        self._build_params()
 
-    def build(self, input_shape):
+    def _build_params(self):
         self.ltl_weights = self.add_weight(name='ltl_weights',
                                            shape=(self.field_size, self.ltl_hidden_size),
                                            initializer=tf.initializers.truncated_normal(mean=0.0, stddev=0.1),
@@ -67,12 +69,12 @@ class LogTransformLayer(keras.layers.Layer):
 class DenseDropBatchNorm(keras.layers.Dense):
 
     def __init__(self, units,
-        activation=None,
-        use_bias=True,
-        kernel_initializer="glorot_uniform",
-        kernel_regularizer=None,
-        dropout = 0.0,
-        use_bn = False, **kwargs):
+                 activation=None,
+                 use_bias=True,
+                 kernel_initializer="glorot_uniform",
+                 kernel_regularizer=None,
+                 dropout=0.0,
+                 use_bn=False, **kwargs):
 
         super(DenseDropBatchNorm, self).__init__(units, activation, use_bias, kernel_initializer,
                                                  kernel_regularizer=kernel_regularizer,
@@ -130,26 +132,28 @@ class AFN(keras.Model):
         self.use_bn = False
         for k, v in kwargs.items():
             setattr(self, k, v)
-        self.ltl = LogTransformLayer(len(self.embedding_dict), self.embedding_size, self.ltl_hidden_size, l2_reg=self.l2_reg)
+        self.ltl = LogTransformLayer(len(self.embedding_dict), self.embedding_size, self.ltl_hidden_size,
+                                     l2_reg=self.l2_reg)
         self.afn_dnn_list = [DenseDropBatchNorm(out_unit,
                                                 activation=self.dnn_activation,
                                                 kernel_regularizer=keras.regularizers.L2(self.l2_reg),
                                                 kernel_initializer=tf.initializers.he_uniform(),
                                                 dropout=self.dnn_dropout, use_bn=self.use_bn)
-                              for out_unit in self.afn_dnn_hidden_units]
+                             for out_unit in self.afn_dnn_hidden_units]
 
         self.ensamble_dnn = [DenseDropBatchNorm(out_unit,
                                                 activation=self.dnn_activation,
                                                 kernel_regularizer=keras.regularizers.L2(self.l2_reg),
                                                 kernel_initializer=tf.initializers.he_uniform(),
                                                 dropout=self.dnn_dropout, use_bn=self.use_bn)
-                              for out_unit in self.ensamble_dnn_units]
+                             for out_unit in self.ensamble_dnn_units]
         if len(self.ensamble_dnn_units) > 0:
-            self.ensamble_dnn.append(keras.layers.Dense(1, activation=self.output_activation, kernel_regularizer=self.l2_reg))
+            self.ensamble_dnn.append(
+                keras.layers.Dense(1, activation=self.output_activation, kernel_regularizer=self.l2_reg))
         self.output_layer = keras.layers.Dense(1, activation=self.output_activation, kernel_regularizer=self.l2_reg)
+        self._build_params()
 
-
-    def build(self, input_shape):
+    def _build_params(self):
         # self.ltl.build(input_shape)
         # for layer in self.afn_dnn_list:
         #     layer.build(input_shape)
@@ -176,7 +180,6 @@ class AFN(keras.Model):
         tf.summary.histogram("linear/b", self.sparse_linear_b)
         return tf.add(tf.sparse.sparse_dense_matmul(x, self.sparse_linear_weight), self.sparse_linear_b)
 
-
     def _build_embedding(self, inputs):
         """The field embedding layer. MLP requires fixed-length vectors as input.
         This function makes sum pooling of feature embeddings for each field.
@@ -186,8 +189,8 @@ class AFN(keras.Model):
             embedding:  The result of field embedding layer, with size of #_fields * #_dim.
             embedding_size: #_fields * #_dim
         """
-        field_indices = inputs['indices'] # indices in sparse mat of [batch x field]
-        field_values = inputs['values']   # values in the sparse mat, representing the feature id
+        field_indices = inputs['indices']  # indices in sparse mat of [batch x field]
+        field_values = inputs['values']  # values in the sparse mat, representing the feature id
         field_weights = inputs['weights']
         field_shape_batch = inputs['shape']
         fm_sparse_index = tf.SparseTensor(field_indices, field_values, field_shape_batch)
@@ -205,7 +208,6 @@ class AFN(keras.Model):
             w_fm_nn_input_orgin, [-1, embedding_size]
         )
         return embedding, embedding_size
-
 
     def _build_dnn(self, inputs, training):
         x = inputs
@@ -229,9 +231,102 @@ class AFN(keras.Model):
 
         return aft_logit
 
+    def predict(self, inputs):
+        pred_logit = self(inputs, False)
+        return tf.nn.sigmoid(pred_logit)
 
-    def loss_function(self, inputs, targets):
-        pred = self(inputs, False)
+    @property
+    def reg_losses(self):
+        loss_set = set()
+        reg_loss = self.losses
+        loss_set.add(id(reg_loss))
+        for l in self.layers:
+            assert not id(l.losses) in loss_set
+            reg_loss += l.losses
+            loss_set.add(l.losses)
+        return reg_loss
+
+    def loss_function(self, pred, targets):
         pred_loss = tf.reduce_mean(keras.losses.binary_crossentropy(targets, pred, from_logits=True))
-        reg_loss = tf.reduce_sum(self.losses)
+        reg_loss = tf.reduce_sum(self.reg_losses)
+        tf.summary.scalar(name='entropy_loss', data=pred_loss)
+        tf.summary.scalar(name='regularized_loss', data=reg_loss)
         return pred_loss + reg_loss
+
+    def metrics(self, pred_list, target_list):
+        if not self.metrics_dict:
+            self.metrics_dict = {'AUC': tf.metrics.AUC(), 'MAE': tf.metrics.MAE()}
+
+        out = {}
+        for pred, target in zip(pred_list, target_list):
+            for m, calc in self.metrics_dict.items():
+                calc.update_state(y_pred=pred, y_true=target)
+
+        for m, calc in self.metrics_dict.items():
+            out[m] = calc.result()
+            tf.summary.scalar(f"valid_{m}", out[m])
+            calc.reset_state()
+        return out
+
+    def fit(
+            self,
+            feature_cnt, field_cnt,
+            train_data,
+            start_learning_rate=0.01,
+            end_learning_rate=1e-5,
+            decay_power=0.5,
+            validation_data=None,
+            batch_size=None,
+            epochs=1,
+            verbose="auto",
+            steps_per_epoch=None,
+            validation_steps=None,
+            validation_batch_size=None,
+            max_queue_size=10,
+            workers=1,
+            use_multiprocessing=False,
+    ):
+        from recommenders.models.deeprec.io.afn_iterator import AFNFFMTextIterator
+        dataset_iterator = AFNFFMTextIterator(batch_size, feature_cnt, field_cnt)
+        train_iterator = iter(dataset_iterator.load_data_from_file(train_data))
+        dataset_iterator = AFNFFMTextIterator(validation_batch_size, feature_cnt, field_cnt)
+        valid_iterator = iter(dataset_iterator.load_data_from_file(validation_data))
+
+        lr_schedule = keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=start_learning_rate,
+                                                                 end_learning_rate=end_learning_rate,
+                                                                 decay_steps=int(steps_per_epoch * 0.8),
+                                                                 cycle=True,
+                                                                 power=decay_power)
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=lr_schedule, beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        optimizer.clipnorm(partial(tf.clip_by_norm(clip_norm=5.0)))
+        step = 1
+
+        @tf.function
+        def train_step(data, target):
+            with tf.GradientTape() as tape:
+                pred_logit = self(data, True)
+                loss = self.loss_function(pred_logit, target)
+            gradients = tape.gradient(loss, self.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+            local_step = optimizer.iterations + 1
+            tf.summary.scalar("lr", lr_schedule(local_step))
+            tf.summary.scalar("step", local_step)
+            return loss
+
+        for e in range(1, epochs + 1):
+            for i in range(steps_per_epoch):
+                if step % validation_steps:
+                    pred_list, label_list = [], []
+                    for i2 in range(validation_steps):
+                        inputs, impression_id_list, cnt = next(valid_iterator)
+                        label_list.append(inputs['label'])
+                        pred_list.append(self.predict(inputs))
+                    metrics_out = self.metrics(pred_list, label_list)
+                    print(f"epoch: {e}, validation: {metrics_out}")
+
+                inputs, impression_id_list, cnt = next(train_iterator)
+                label = inputs['label']
+                loss = train_step(inputs, label)
+                print(f"epoch: {e}, step: {step}, loss = {loss.numpy()}")
