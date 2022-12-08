@@ -68,10 +68,10 @@ def test_afn_model(deeprec_resource_path):
 
     model.train_model(train_data=osp.join(data_path, "synthetic_part_0"),
               validation_data=osp.join(data_path, "synthetic_part_1"),
-              start_learning_rate=hparams.start_learning_rate,
-              end_learning_rate=hparams.end_learning_rate,
-              decay_power=hparams.decay_power,
-              batch_size=hparams.batch_size,
+              start_learning_rate=float(hparams.start_learning_rate),
+              end_learning_rate=float(hparams.end_learning_rate),
+              decay_power=float(hparams.decay_power),
+              batch_size=int(hparams.batch_size),
               epochs=1,
               steps_per_epoch=1,
               validation_steps=1)
