@@ -244,8 +244,8 @@ class AFN(keras.Model):
         return pred_loss + reg_loss
 
     def metrics(self, pred_list, target_list):
-        if not self.metrics_dict:
-            self.metrics_dict = {'AUC': tf.metrics.AUC(), 'MAE': tf.metrics.MAE()}
+        if not hasattr(self, "metrics_dict"):
+            self.metrics_dict = {'AUC': tf.metrics.AUC(), 'MAE': tf.metrics.MeanAbsoluteError()}
 
         out = {}
         for pred, target in zip(pred_list, target_list):
@@ -259,7 +259,7 @@ class AFN(keras.Model):
         return out
 
     def train_model(
-            self,
+            self, logdir,
             train_data,
             start_learning_rate=0.01,
             end_learning_rate=1e-5,
@@ -283,13 +283,14 @@ class AFN(keras.Model):
 
         lr_schedule = keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=start_learning_rate,
                                                                  end_learning_rate=end_learning_rate,
-                                                                 decay_steps=int(steps_per_epoch * 0.8),
+                                                                 decay_steps=100,
                                                                  cycle=True,
                                                                  power=decay_power)
         optimizer = tf.keras.optimizers.Adam(
             learning_rate=lr_schedule, beta_1=0.9, beta_2=0.999, epsilon=1e-7
         )
         optimizer.clipnorm = 5.0
+        tf.summary.experimental.set_step(optimizer.iterations)
         step = 1
 
         train_step_signature = [
@@ -319,6 +320,7 @@ class AFN(keras.Model):
             },
         ]
 
+        tfsm_writor = tf.summary.create_file_writer(logdir=logdir)
         @tf.function(input_signature=train_step_signature)
         def train_step(data):
             target = tf.squeeze(data['label'])
@@ -332,29 +334,27 @@ class AFN(keras.Model):
             tf.summary.scalar("step", local_step)
             return loss
 
-        for e in range(1, epochs + 1):
-            ts = 0
-            for (inputs, impression_id_list, cnt) in tqdm(train_iterator.load_data_from_file(train_data)):
-                if step % validation_steps:
-                    pred_list, label_list = [], []
-                    vs = 0
-                    for (inputs_val, _, _) in tqdm(valid_iterator.load_data_from_file(validation_data)):
-                        label_list.append(inputs_val['label'])
-                        pred_list.append(self.predict(inputs_val))
-                        vs += 1
-                        if vs >= validation_steps:
-                            print(f"break valid at step {vs}")
-                            break
-                    metrics_out = self.metrics(pred_list, label_list)
-                    print(f"epoch: {e}, validation: {metrics_out}")
+        with tfsm_writor.as_default():
+            for e in range(1, epochs + 1):
+                ts = 0
+                for (inputs, impression_id_list, cnt) in tqdm(train_iterator.load_data_from_file(train_data)):
+                    if step % validation_steps == 0:
+                        pred_list, label_list = [], []
+                        for (inputs_val, _, _) in tqdm(valid_iterator.load_data_from_file(validation_data)):
+                            label_list.append(np.squeeze(inputs_val['label']))
+                            pred_list.append(self.predict(inputs_val))
 
-                loss = train_step(inputs)
-                print(f"epoch: {e}, step: {step}, loss = {loss}")
-                step += 1
-                ts += 1
-                if ts >= steps_per_epoch:
-                    print(f"epoch {e}, break at step {ts}")
-                    break
+                        metrics_out = self.metrics(pred_list, label_list)
+                        print(f"epoch: {e}, validation: {metrics_out}")
+
+                    loss = train_step(inputs)
+                    print(f"epoch: {e}, step: {step}, loss = {loss}")
+                    step += 1
+                    ts += 1
+                    if ts >= steps_per_epoch:
+                        print(f"epoch {e}, break at step {ts}")
+                        break
+        tfsm_writor.flush()
 
     def create_inputs(self, inputs_dict):
         label = inputs_dict['label']

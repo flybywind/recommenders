@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
-
+import numpy as np
 import pytest
 import os
 import os.path as osp
@@ -41,9 +41,8 @@ def test_afn_ffm_files(deeprec_resource_path):
 
 @pytest.mark.gpu
 def test_afn_model(deeprec_resource_path):
-
+    # Note: must split the test from models like xDeepFM, which use tf.v1 to construct the Graph
     # tf.config.run_functions_eagerly(True)
-    # tf.compat.v1.reset_default_graph()
     data_path = os.path.join(deeprec_resource_path, "xdeepfm")
     yaml_file = os.path.join(data_path, "AFN.yaml")
     if not os.path.exists(yaml_file):
@@ -66,12 +65,14 @@ def test_afn_model(deeprec_resource_path):
     )
 
 
-    model.train_model(train_data=osp.join(data_path, "synthetic_part_0"),
+    model.train_model(
+            logdir=osp.join(data_path, "tf_sum"),
+              train_data=osp.join(data_path, "synthetic_part_0"),
               validation_data=osp.join(data_path, "synthetic_part_1"),
               start_learning_rate=float(hparams.start_learning_rate),
               end_learning_rate=float(hparams.end_learning_rate),
               decay_power=float(hparams.decay_power),
               batch_size=int(hparams.batch_size),
-              epochs=1,
-              steps_per_epoch=1,
-              validation_steps=1)
+              epochs=2,
+              steps_per_epoch=40,
+              validation_steps=20)
