@@ -1,10 +1,8 @@
 import numpy as np
+import tensorflow as tf
 
-from recommenders.models.deeprec.io.iterator import FFMTextIterator
-
-
-class AFNFFMTextIterator(FFMTextIterator):
-    def __init__(self, batch_size, feature_cnt, field_cnt,  col_spliter=" ", ID_spliter="%"):
+class AFNFFMTextIterator:
+    def __init__(self, batch_size, feature_cnt, field_cnt, col_spliter=" ", ID_spliter="%"):
         self.batch_size = batch_size
         self.feature_cnt = feature_cnt
         self.field_cnt = field_cnt
@@ -19,17 +17,156 @@ class AFNFFMTextIterator(FFMTextIterator):
         self.dnn_feat_values = "values"
         self.dnn_feat_weights = "weights"
         self.dnn_feat_shape = "shape"
-    # def gen_feed_dict(self, data_dict):
-    #     feed_dict = super(AFNFFMTextIterator, self).gen_feed_dict(data_dict)
-    #     feed_dict2 = {}
-    #     for n, feat in feed_dict.items():
-    #         feed_dict2[n] = feat
-    #     return feed_dict2
 
-    # def gen_feed_dict(self, data_dict):
-    #     res = super(AFNFFMTextIterator, self).gen_feed_dict(data_dict)
-    #     oh_shape = res['oh_shape']
-    #     shape = res['shape']
-    #     batch_size = shape[0]
-    #     res['oh_shape'] = [batch_size, oh_shape[0]/batch_size, oh_shape[2]]
-    #     res['oh_indices'] = np.reshape(res['oh_indices'], [batch_size, -1, ])
+    def parser_one_line(self, line):
+        """Parse one string line into feature values.
+
+        Args:
+            line (str): A string indicating one instance.
+
+        Returns:
+            list: Parsed results, including `label`, `features` and `impression_id`.
+
+        """
+        impression_id = 0
+        words = line.strip().split(self.ID_spliter)
+        if len(words) == 2:
+            impression_id = words[1].strip()
+
+        cols = words[0].strip().split(self.col_spliter)
+
+        label = float(cols[0])
+
+        features = []
+        for word in cols[1:]:
+            if not word.strip():
+                continue
+            tokens = word.split(":")
+            features.append([int(tokens[0]) - 1, int(tokens[1]) - 1, float(tokens[2])])
+
+        return label, features, impression_id
+
+    def load_data_from_file(self, infile):
+        """Read and parse data from a file.
+
+        Args:
+            infile (str): Text input file. Each line in this file is an instance.
+
+        Returns:
+            object: An iterator that yields parsed results, in the format of graph `feed_dict`.
+        """
+        label_list = []
+        features_list = []
+        impression_id_list = []
+        cnt = 0
+
+        with tf.io.gfile.GFile(infile, "r") as rd:
+            for line in rd:
+                label, features, impression_id = self.parser_one_line(line)
+
+                features_list.append(features)
+                label_list.append(label)
+                impression_id_list.append(impression_id)
+
+                cnt += 1
+                if cnt == self.batch_size:
+                    res = self._convert_data(label_list, features_list)
+                    yield self.gen_feed_dict(res), impression_id_list, self.batch_size
+                    label_list = []
+                    features_list = []
+                    impression_id_list = []
+                    cnt = 0
+            if cnt > 0:
+                res = self._convert_data(label_list, features_list)
+                yield self.gen_feed_dict(res), impression_id_list, cnt
+
+    def _convert_data(self, labels, features):
+        """Convert data into numpy arrays that are good for further operation.
+
+        Args:
+            labels (list): a list of ground-truth labels.
+            features (list): a 3-dimensional list, carrying a list (batch_size) of feature array,
+                    where each feature array is a list of `[field_idx, feature_idx, feature_value]` tuple.
+
+        Returns:
+            dict: A dictionary, containing multiple numpy arrays that are convenient for further operation.
+        """
+        dim = self.feature_cnt
+        FIELD_COUNT = self.field_cnt
+        instance_cnt = len(labels)
+
+        fm_feat_indices = []
+        fm_feat_values = []
+        fm_feat_shape = [instance_cnt, dim]
+
+        dnn_feat_indices = []
+        dnn_feat_values = []
+        dnn_feat_weights = []
+        dnn_feat_shape = [instance_cnt * FIELD_COUNT, -1]
+
+        for i in range(instance_cnt):
+            m = len(features[i])
+            dnn_feat_dic = {}
+            for j in range(m):
+                fm_feat_indices.append([i, features[i][j][1]])
+                fm_feat_values.append(features[i][j][2])
+                if features[i][j][0] not in dnn_feat_dic:
+                    dnn_feat_dic[features[i][j][0]] = 0
+                else:
+                    dnn_feat_dic[features[i][j][0]] += 1
+                dnn_feat_indices.append(
+                    [
+                        i * FIELD_COUNT + features[i][j][0],
+                        dnn_feat_dic[features[i][j][0]],
+                    ]
+                )
+                dnn_feat_values.append(features[i][j][1])
+                dnn_feat_weights.append(features[i][j][2])
+                if dnn_feat_shape[1] < dnn_feat_dic[features[i][j][0]]:
+                    dnn_feat_shape[1] = dnn_feat_dic[features[i][j][0]]
+        dnn_feat_shape[1] += 1
+
+        sorted_index = sorted(
+            range(len(dnn_feat_indices)),
+            key=lambda k: (dnn_feat_indices[k][0], dnn_feat_indices[k][1]),
+        )
+
+        res = {}
+        res["fm_feat_indices"] = np.asarray(fm_feat_indices, dtype=np.int64)
+        res["fm_feat_values"] = np.asarray(fm_feat_values, dtype=np.float32)
+        res["fm_feat_shape"] = np.asarray(fm_feat_shape, dtype=np.int64)
+        res["labels"] = np.asarray([[label] for label in labels], dtype=np.float32)
+
+        res["dnn_feat_indices"] = np.asarray(dnn_feat_indices, dtype=np.int64)[
+            sorted_index
+        ]
+        res["dnn_feat_values"] = np.asarray(dnn_feat_values, dtype=np.int64)[
+            sorted_index
+        ]
+        res["dnn_feat_weights"] = np.asarray(dnn_feat_weights, dtype=np.float32)[
+            sorted_index
+        ]
+        res["dnn_feat_shape"] = np.asarray(dnn_feat_shape, dtype=np.int64)
+        return res
+
+    def gen_feed_dict(self, data_dict):
+        """Construct a dictionary that maps graph elements to values.
+
+        Args:
+            data_dict (dict): A dictionary that maps string name to numpy arrays.
+
+        Returns:
+            dict: A dictionary that maps graph elements to numpy arrays.
+
+        """
+        feed_dict = {
+            self.labels: data_dict["labels"],
+            self.fm_feat_indices: data_dict["fm_feat_indices"],
+            self.fm_feat_values: data_dict["fm_feat_values"],
+            self.fm_feat_shape: data_dict["fm_feat_shape"],
+            self.dnn_feat_indices: data_dict["dnn_feat_indices"],
+            self.dnn_feat_values: data_dict["dnn_feat_values"],
+            self.dnn_feat_weights: data_dict["dnn_feat_weights"],
+            self.dnn_feat_shape: data_dict["dnn_feat_shape"],
+        }
+        return feed_dict

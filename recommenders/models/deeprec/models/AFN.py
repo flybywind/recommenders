@@ -7,6 +7,7 @@ Reference:
     [1] Cheng, W., Shen, Y. and Huang, L. 2020. Adaptive Factorization Network: Learning Adaptive-Order Feature
          Interactions. Proceedings of the AAAI Conference on Artificial Intelligence. 34, 04 (Apr. 2020), 3609-3616.
 """
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tqdm import tqdm
@@ -229,7 +230,7 @@ class AFN(keras.Model):
             x = self.ensamble_dnn[-1](x)
             aft_logit += x
 
-        return aft_logit
+        return tf.squeeze(aft_logit)
 
     def predict(self, inputs):
         pred_logit = self(inputs, False)
@@ -295,7 +296,7 @@ class AFN(keras.Model):
             {
                 "oh_indices": tf.TensorSpec(shape=(None, 2), dtype=tf.int64),
                 "oh_values": tf.TensorSpec(
-                    shape=(None,), dtype=tf.int64
+                    shape=(None,), dtype=tf.float32
                 ),
                 "oh_shape": tf.TensorSpec(
                     shape=(2,), dtype=tf.int64
@@ -307,19 +308,22 @@ class AFN(keras.Model):
                     shape=(None, ), dtype=tf.int64
                 ),
                 "weights": tf.TensorSpec(
-                    shape=(None, ), dtype=tf.int64
+                    shape=(None, ), dtype=tf.float32
                 ),
                 "shape": tf.TensorSpec(
                     shape=(2,), dtype=tf.int64
-                )
+                ),
+                "label": tf.TensorSpec(
+                    shape=(None, 1), dtype=tf.float32
+                ),
             },
-            tf.TensorSpec(shape=(None, ), dtype=tf.float32),
         ]
 
         @tf.function(input_signature=train_step_signature)
-        def train_step(data, target):
+        def train_step(data):
+            target = tf.squeeze(data['label'])
             with tf.GradientTape() as tape:
-                pred_logit = self(data, True)
+                pred_logit = self(data, training=True)
                 loss = self.loss_function(pred_logit, target)
             gradients = tape.gradient(loss, self.trainable_variables)
             optimizer.apply_gradients(zip(gradients, self.trainable_variables))
@@ -344,8 +348,7 @@ class AFN(keras.Model):
                     metrics_out = self.metrics(pred_list, label_list)
                     print(f"epoch: {e}, validation: {metrics_out}")
 
-                label = inputs['label']
-                loss = train_step(inputs, label)
+                loss = train_step(inputs)
                 print(f"epoch: {e}, step: {step}, loss = {loss}")
                 step += 1
                 ts += 1
