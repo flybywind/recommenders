@@ -12,6 +12,9 @@ import tensorflow as tf
 from tensorflow import keras
 from tqdm import tqdm
 
+from recommenders.models.deeprec.io.afn_iterator import AFNFFMTextIterator
+
+
 class LogTransformLayer(keras.layers.Layer):
     """Logarithmic Transformation Layer in Adaptive factorization network, which models arbitrary-order cross features.
 
@@ -47,6 +50,7 @@ class LogTransformLayer(keras.layers.Layer):
         self.ltl_biases = self.add_weight(name='ltl_bias',
                                           shape=(1, 1, self.ltl_hidden_size),
                                           initializer=tf.initializers.zeros(),
+                                          regularizer=self.l2_regularizer,
                                           dtype=tf.float32)
 
     def call(self, inputs, training):
@@ -58,11 +62,12 @@ class LogTransformLayer(keras.layers.Layer):
         ltl_result = tf.math.log(afn_input_trans)
         ltl_result = self.bn[0](ltl_result, training)
         ltl_result = tf.matmul(ltl_result, self.ltl_weights) + self.ltl_biases
-        tf.summary.histogram(name='logOrder', data=self.ltl_weights)
+        tf.summary.histogram(name=self.ltl_weights.name, data=self.ltl_weights)
+        tf.summary.histogram(name=self.ltl_biases.name, data=self.ltl_biases)
         ltl_result = tf.math.exp(ltl_result)
         ltl_result = self.bn[1](ltl_result, training)
         out_shape = tf.shape(ltl_result)
-        ltl_result = tf.reshape(ltl_result, [-1, out_shape[1]*out_shape[2]], name='flatten')
+        ltl_result = tf.reshape(ltl_result, [-1, out_shape[1] * out_shape[2]], name='flatten')
         return ltl_result
 
 
@@ -78,6 +83,7 @@ class DenseDropBatchNorm(keras.layers.Dense):
 
         super(DenseDropBatchNorm, self).__init__(units, activation, use_bias, kernel_initializer,
                                                  kernel_regularizer=kernel_regularizer,
+                                                 bias_regularizer=kernel_regularizer,
                                                  dtype=tf.float32, **kwargs)
         self.batch_norm = None
         self.dropout = None
@@ -87,9 +93,9 @@ class DenseDropBatchNorm(keras.layers.Dense):
             self.dropout = keras.layers.Dropout(dropout)
 
     def call(self, inputs, training):
-        y = super(DenseDropBatchNorm, self).call(inputs)
         if self.batch_norm:
-            y = self.batch_norm(y, training)
+            inputs = self.batch_norm(inputs, training)
+        y = super(DenseDropBatchNorm, self).call(inputs)
         if self.dropout:
             y = self.dropout(y, training)
         return y
@@ -128,7 +134,7 @@ class AFN(keras.Model):
         self.init_std = 0.0001
         self.dnn_dropout = 0.0
         self.dnn_activation = 'relu'
-        self.output_activation = 'elu'
+        self.output_activation = None
         self.use_bn = False
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -137,35 +143,41 @@ class AFN(keras.Model):
         self.afn_dnn_list = [DenseDropBatchNorm(out_unit,
                                                 activation=self.dnn_activation,
                                                 kernel_regularizer=keras.regularizers.L2(self.l2_reg),
-                                                kernel_initializer=tf.initializers.he_uniform(),
+                                                kernel_initializer="he_uniform",
                                                 dropout=self.dnn_dropout, use_bn=self.use_bn)
                              for out_unit in self.afn_dnn_hidden_units]
+        self.afn_dnn_list.append(DenseDropBatchNorm(1, activation=self.output_activation,
+                                                    kernel_regularizer=keras.regularizers.L2(self.l2_reg),
+                                                    kernel_initializer="he_uniform",
+                                                    dropout=self.dnn_dropout, use_bn=self.use_bn))
 
-        self.ensamble_dnn = [DenseDropBatchNorm(out_unit,
-                                                activation=self.dnn_activation,
-                                                kernel_regularizer=keras.regularizers.L2(self.l2_reg),
-                                                kernel_initializer=tf.initializers.he_uniform(),
-                                                dropout=self.dnn_dropout, use_bn=self.use_bn)
-                             for out_unit in self.ensamble_dnn_units]
-        if len(self.ensamble_dnn_units) > 0:
+        if isinstance(self.ensamble_dnn_units, list):
+            self.ensamble_dnn = [DenseDropBatchNorm(out_unit,
+                                                    activation=self.dnn_activation,
+                                                    kernel_regularizer=keras.regularizers.L2(self.l2_reg),
+                                                    kernel_initializer="he_uniform",
+                                                    dropout=self.dnn_dropout, use_bn=self.use_bn,
+                                                    name=f'ensemble_dnn_{i}')
+                                 for i, out_unit in enumerate(self.ensamble_dnn_units)]
             self.ensamble_dnn.append(
-                keras.layers.Dense(1, activation=self.output_activation, kernel_regularizer=keras.regularizers.L2(self.l2_reg)))
-        self.output_layer = keras.layers.Dense(1, activation=self.output_activation, kernel_regularizer=keras.regularizers.L2(self.l2_reg))
+                keras.layers.Dense(1, activation=self.output_activation,
+                                   kernel_initializer="he_uniform",
+                                   kernel_regularizer=keras.regularizers.L2(self.l2_reg)))
+        else:
+            self.ensamble_dnn = []
+        # self.output_layer = keras.layers.Dense(1, activation=self.output_activation, kernel_regularizer=keras.regularizers.L2(self.l2_reg))
+        self.out_func = keras.activations.get(self.output_activation)
         self._build_params()
 
     def _build_params(self):
-        # self.ltl.build(input_shape)
-        # for layer in self.afn_dnn_list:
-        #     layer.build(input_shape)
-        # self.output_layer.
-        self.sparse_linear_weight = self.add_weight(name='sparse_weight', shape=(self.feature_cnt, 1),
-                                                    initializer=tf.initializers.glorot_normal(),
-                                                    regularizer=keras.regularizers.L2(self.l2_reg),
-                                                    dtype=tf.float32)
-        self.sparse_linear_b = self.add_weight(name='sparse_linear_b', shape=(1,),
-                                               initializer='zero',
-                                               regularizer=keras.regularizers.L2(self.l2_reg),
-                                               dtype=tf.float32)
+        # self.sparse_linear_weight = self.add_weight(name='sparse_weight', shape=(self.feature_cnt, 1),
+        #                                             initializer=tf.initializers.glorot_normal(),
+        #                                             regularizer=keras.regularizers.L2(self.l2_reg),
+        #                                             dtype=tf.float32)
+        # self.sparse_linear_b = self.add_weight(name='sparse_linear_b', shape=(1,),
+        #                                        initializer='zero',
+        #                                        regularizer=keras.regularizers.L2(self.l2_reg),
+        #                                        dtype=tf.float32)
         self.embedding = self.add_weight(name='emb_mat', shape=(self.feature_cnt, self.embedding_size),
                                          initializer=tf.initializers.glorot_normal(),
                                          regularizer=keras.regularizers.L2(self.l2_reg),
@@ -173,13 +185,15 @@ class AFN(keras.Model):
 
     def _build_linear(self, inputs):
         # read indices of one-hot sparse encoding
-        indices = inputs['oh_indices']
-        values = inputs['oh_values']
-        dense_shape = inputs['oh_shape']
-        x = tf.SparseTensor(indices, values, dense_shape)
-        tf.summary.histogram("linear/w", self.sparse_linear_weight)
-        tf.summary.histogram("linear/b", self.sparse_linear_b)
-        return tf.add(tf.sparse.sparse_dense_matmul(x, self.sparse_linear_weight), self.sparse_linear_b)
+        # indices = inputs['oh_indices']
+        # values = inputs['oh_values']
+        # dense_shape = inputs['oh_shape']
+        # x = tf.SparseTensor(indices, values, dense_shape)
+        # tf.summary.histogram(self.sparse_linear_weight.name, self.sparse_linear_weight)
+        # tf.summary.histogram(self.sparse_linear_b.name, self.sparse_linear_b)
+        # return self.out_func(
+        #     tf.add(tf.sparse.sparse_dense_matmul(x, self.sparse_linear_weight), self.sparse_linear_b))
+        return self.out_func(tf.reduce_sum(inputs, axis=-1, keepdims=True))
 
     def _build_embedding(self, inputs):
         """The field embedding layer. MLP requires fixed-length vectors as input.
@@ -204,6 +218,7 @@ class AFN(keras.Model):
             sp_weights=fm_sparse_weight,
             combiner="sum",
         )
+        # tf.summary.histogram("embedding", self.embedding)
         embedding = tf.reshape(
             embedding, [-1, self.field_cnt, self.embedding_size]
         )
@@ -213,24 +228,35 @@ class AFN(keras.Model):
         x = inputs
         for layer in self.afn_dnn_list:
             x = layer(x, training)
+            for w in layer.trainable_weights:
+                if w.name.split('/')[-1].split(':')[0] in ("kernel", "bias"):
+                    tf.summary.histogram(f"dnn/{w.name}", w)
         return x
 
     def call(self, inputs, training):
-        logit = self._build_linear(inputs)
+
         afn_input = self._build_embedding(inputs)
+        x = tf.reshape(afn_input, [-1, self.embedding_size * self.field_cnt])
+        logit = self._build_linear(x)
+        tf.summary.histogram(f"linear_logit", logit)
         ltl_result = self.ltl(afn_input, training)
         afn_logit = self._build_dnn(ltl_result, training)
-        logit += afn_logit
-        aft_logit = self.output_layer(afn_logit)
+        tf.summary.histogram(f"afn_logit", afn_logit)
+        afn_logit += logit
+        tf.summary.histogram(f"afn_add_linear_logit", afn_logit)
 
         if len(self.ensamble_dnn) > 0:
-            x = tf.reshape(afn_input, [-1, self.embedding_size*self.field_cnt])
             for layer in self.ensamble_dnn[:-1]:
                 x = layer(x, training)
+                for w in layer.trainable_weights:
+                    if w.name.split('/')[-1].split(':')[0] in ("kernel", "bias"):
+                        tf.summary.histogram(f"ensemble/{w.name}", w)
             x = self.ensamble_dnn[-1](x)
-            aft_logit += x
+            tf.summary.histogram(f"ensemble_logit", x)
+            afn_logit += x
 
-        return tf.squeeze(aft_logit)
+        tf.summary.histogram(f"final_logit", afn_logit)
+        return tf.squeeze(afn_logit)
 
     def predict(self, inputs):
         pred_logit = self(inputs, False)
@@ -275,15 +301,11 @@ class AFN(keras.Model):
             workers=1,
             use_multiprocessing=False,
     ):
-        from recommenders.models.deeprec.io.afn_iterator import AFNFFMTextIterator
         train_iterator = AFNFFMTextIterator(batch_size, self.feature_cnt, self.field_cnt)
-        # train_iterator = iter(dataset_iterator.load_data_from_file(train_data))
-        valid_iterator = AFNFFMTextIterator(validation_batch_size, self.feature_cnt, self.field_cnt)
-        # valid_iterator = iter(dataset_iterator.load_data_from_file(validation_data))
 
         lr_schedule = keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=start_learning_rate,
                                                                  end_learning_rate=end_learning_rate,
-                                                                 decay_steps=100,
+                                                                 decay_steps=steps_per_epoch,
                                                                  cycle=True,
                                                                  power=decay_power)
         optimizer = tf.keras.optimizers.Adam(
@@ -306,10 +328,10 @@ class AFN(keras.Model):
                     shape=(None, 2), dtype=tf.int64
                 ),
                 "values": tf.TensorSpec(
-                    shape=(None, ), dtype=tf.int64
+                    shape=(None,), dtype=tf.int64
                 ),
                 "weights": tf.TensorSpec(
-                    shape=(None, ), dtype=tf.float32
+                    shape=(None,), dtype=tf.float32
                 ),
                 "shape": tf.TensorSpec(
                     shape=(2,), dtype=tf.int64
@@ -321,6 +343,7 @@ class AFN(keras.Model):
         ]
 
         tfsm_writor = tf.summary.create_file_writer(logdir=logdir)
+
         @tf.function(input_signature=train_step_signature)
         def train_step(data):
             target = tf.squeeze(data['label'])
@@ -329,34 +352,57 @@ class AFN(keras.Model):
                 loss = self.loss_function(pred_logit, target)
             gradients = tape.gradient(loss, self.trainable_variables)
             optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+            flat_grad = [tf.reshape(g, (-1,)) for g in gradients]
+            flat_grad = tf.concat(flat_grad, -1)
+            tf.summary.histogram(name='gradients', data=flat_grad)
             local_step = optimizer.iterations + 1
             tf.summary.scalar("lr", lr_schedule(local_step))
             tf.summary.scalar("step", local_step)
             return loss
 
+        history = {}
+
+        def append_history(loss, metrics):
+            if "loss" in history:
+                history['loss'].append(loss)
+            else:
+                history['loss'] = [loss]
+            for m, v in metrics.items():
+                if m in history:
+                    history[m].append(v)
+                else:
+                    history[m] = [v]
+
         with tfsm_writor.as_default():
             for e in range(1, epochs + 1):
                 ts = 0
                 for (inputs, impression_id_list, cnt) in tqdm(train_iterator.load_data_from_file(train_data)):
-                    if step % validation_steps == 0:
-                        pred_list, label_list = [], []
-                        for (inputs_val, _, _) in tqdm(valid_iterator.load_data_from_file(validation_data)):
-                            label_list.append(np.squeeze(inputs_val['label']))
-                            pred_list.append(self.predict(inputs_val))
-
-                        metrics_out = self.metrics(pred_list, label_list)
-                        print(f"epoch: {e}, validation: {metrics_out}")
-
                     loss = train_step(inputs)
-                    print(f"epoch: {e}, step: {step}, loss = {loss}")
+                    if step % validation_steps == 0:
+                        # print(f"epoch: {e}, step: {step}, loss = {loss}")
+                        metrics_out = self.eval_dataset(validation_data, validation_batch_size)
+                        # metrics_out = {k:v.numpy() for k,v in metrics_out.items()}
+                        print(f"epoch: {e}, step = {step}, loss = {loss}, validation: {metrics_out}")
+                        append_history(loss, metrics_out)
+
                     step += 1
                     ts += 1
                     if ts >= steps_per_epoch:
                         print(f"epoch {e}, break at step {ts}")
                         break
+        metrics_out = self.eval_dataset(validation_data, validation_batch_size)
+        print(f"end all epoch: {e}, step = {step}, loss = {loss}, validation: {metrics_out}")
+        append_history(loss, metrics_out)
         tfsm_writor.flush()
 
-    def create_inputs(self, inputs_dict):
-        label = inputs_dict['label']
-        del inputs_dict['label']
-        return inputs_dict, label
+        return history
+
+    def eval_dataset(self, validation_data, validation_batch_size):
+        valid_iterator = AFNFFMTextIterator(validation_batch_size, self.feature_cnt, self.field_cnt)
+        pred_list, label_list = [], []
+        for (inputs_val, _, _) in valid_iterator.load_data_from_file(validation_data):
+            label_list.append(np.squeeze(inputs_val['label']))
+            pred_list.append(self.predict(inputs_val))
+
+        metrics_out = self.metrics(pred_list, label_list)
+        return metrics_out

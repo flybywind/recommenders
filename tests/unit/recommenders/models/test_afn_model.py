@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import os
 import os.path as osp
+import tensorflow as tf
 from recommenders.models.deeprec.deeprec_utils import (
     prepare_hparams,
     download_deeprec_resources,
@@ -56,7 +57,7 @@ def test_afn_model(deeprec_resource_path):
     model = AFN(field_cnt=hparams.FIELD_COUNT, feature_cnt=hparams.FEATURE_COUNT,
                 embedding_size=hparams.embedding_size, ltl_hidden_size = hparams.ltl_hidden_size,
                 afn_dnn_hidden_units = hparams.afn_dnn_hidden_units,
-                ensamble_dnn_units = hparams.ensamble_dnn_units,
+                ensamble_dnn_units = [100, 100, 100],
                 l2_reg = hparams.l2_reg,
                 dnn_dropout = hparams.dnn_dropout,
                 dnn_activation = hparams.dnn_activation,
@@ -74,5 +75,5 @@ def test_afn_model(deeprec_resource_path):
               decay_power=float(hparams.decay_power),
               batch_size=int(hparams.batch_size),
               epochs=2,
-              steps_per_epoch=40,
-              validation_steps=20)
+              steps_per_epoch=200,
+              validation_steps=400)
